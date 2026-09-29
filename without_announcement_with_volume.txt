@@ -1,0 +1,399 @@
+import socket
+import os
+import time
+
+# ==========================================
+# GLOBAL CONFIGURATION
+# ==========================================
+
+target_ip = '192.168.0.222'
+PORT = 5500
+FILE_NAME = 'song.mp3'
+
+COMMAND_TIMEOUT = 3
+UPLOAD_TIMEOUT = 15
+RETRY_DELAY = 1.5
+MAX_RETRIES = 5
+
+# ==========================================
+# CREATE ROBUST SOCKET
+# ==========================================
+
+def create_socket(timeout):
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+    # Disable Nagle
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
+    # Enable KeepAlive
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+
+    # Large send buffer
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
+
+    sock.settimeout(timeout)
+
+    return sock
+
+# ==========================================
+# RECEIVE FULL RESPONSE
+# ==========================================
+
+def receive_response(sock):
+
+    response = b""
+
+    try:
+
+        while True:
+
+            part = sock.recv(1024)
+
+            if not part:
+                break
+
+            response += part
+
+            # Stop once ACK/BUSY received
+            if b"ACK" in response:
+                break
+
+            if b"BUSY" in response:
+                break
+
+            if b"UPLOAD_OK" in response:
+                break
+
+            # FIX 1: ESP32 sends "ERR" on unknown command — was looping until
+            # timeout because ERR was never checked, blocking for full 3 seconds.
+            if b"ERR" in response:
+                break
+
+    except socket.timeout:
+        pass
+
+    return response.decode(errors="ignore").strip()
+
+# ==========================================
+# LOW LEVEL COMMAND SENDER
+# ==========================================
+
+def send_command(cmd):
+
+    sock = create_socket(COMMAND_TIMEOUT)
+
+    try:
+
+        sock.connect((target_ip, PORT))
+
+        # FIX 2: ESP32 firmware reads until '\n' (if c == '\n' break).
+        # Without the newline, the ESP32's read loop never exits and the
+        # command is never processed — PLAY/STOP/VOL all silently failed.
+        payload = cmd.strip() + "\n"
+
+        sock.sendall(payload.encode())
+
+        response = receive_response(sock)
+
+        if "ACK" in response:
+            return True
+
+        elif "BUSY" in response:
+            print("[-] ESP32 Busy")
+            return False
+
+        else:
+            print(f"[-] Unexpected Response: {response}")
+            return False
+
+    except socket.timeout:
+        print("[-] Command Timeout")
+        return False
+
+    except Exception as e:
+        print(f"[-] Network Error: {e}")
+        return False
+
+    finally:
+
+        # FIX 3: shutdown() on a socket that never connected raises an error.
+        # Guard with a try/except per-call so close() always runs regardless.
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except:
+            pass
+
+        sock.close()
+
+# ==========================================
+# RELIABLE COMMAND WRAPPER
+# ==========================================
+
+def reliable_send(cmd, retries=MAX_RETRIES):
+
+    for attempt in range(1, retries + 1):
+
+        if send_command(cmd):
+
+            return True
+
+        print(f"[-] Retry {attempt}/{retries}")
+
+        time.sleep(RETRY_DELAY)
+
+    return False
+
+# ==========================================
+# UPLOAD FILE
+# ==========================================
+
+def upload_file():
+
+    if not os.path.exists(FILE_NAME):
+
+        print(f"[-] ERROR: '{FILE_NAME}' not found.")
+        return
+
+    sock = create_socket(UPLOAD_TIMEOUT)
+
+    try:
+
+        sock.connect((target_ip, PORT))
+
+        # ==========================================
+        # SEND UPLOAD COMMAND
+        # ==========================================
+
+        # FIX 4: Same as FIX 2 — UPLD command also needs '\n' so the ESP32
+        # firmware's read loop terminates and it enters the upload handler.
+        sock.sendall("UPLD\n".encode())
+
+        time.sleep(0.1)
+
+        print(f"\n[*] Uploading {FILE_NAME} to {target_ip}")
+
+        file_size = os.path.getsize(FILE_NAME)
+
+        bytes_sent = 0
+
+        start_time = time.time()
+
+        # ==========================================
+        # SEND FILE
+        # ==========================================
+
+        with open(FILE_NAME, 'rb') as f:
+
+            while True:
+
+                chunk = f.read(4096)
+
+                if not chunk:
+                    break
+
+                sock.sendall(chunk)
+
+                bytes_sent += len(chunk)
+
+                percent = (bytes_sent / file_size) * 100
+
+                elapsed = time.time() - start_time
+
+                speed = bytes_sent / 1024 / elapsed if elapsed > 0 else 0
+
+                print(
+                    f"[*] {percent:.1f}% | "
+                    f"{bytes_sent}/{file_size} bytes | "
+                    f"{speed:.1f} KB/s",
+                    end='\r'
+                )
+
+                # Dynamic throttle
+                if bytes_sent > 500000:
+                    time.sleep(0.003)
+                else:
+                    time.sleep(0.001)
+
+        print("\n[+] File transfer finished")
+
+        # ==========================================
+        # WAIT FOR ESP32 CONFIRMATION
+        # ==========================================
+        sock.shutdown(socket.SHUT_WR)
+        
+        print("[*] Waiting for ESP32 confirmation...")
+
+        response = receive_response(sock)
+
+        if "UPLOAD_OK" in response:
+
+            print("[+] ESP32 confirmed upload success")
+
+        else:
+
+            print(f"[-] No UPLOAD_OK received: {response}")
+
+    except socket.timeout:
+
+        print("\n[-] Upload Timeout")
+
+    except Exception as e:
+
+        print(f"\n[-] Upload Error: {e}")
+
+    finally:
+
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except:
+            pass
+
+        sock.close()
+
+# ==========================================
+# SET VOLUME
+# ==========================================
+
+def set_volume():
+
+    try:
+
+        volume = int(input("Enter Volume (0-100): "))
+
+        if volume < 0:
+            volume = 0
+
+        if volume > 100:
+            volume = 100
+
+        command = f"VOL:{volume}"
+
+        print(f"[*] Setting Volume = {volume}%")
+
+        if reliable_send(command):
+
+            print(f"[+] Volume changed to {volume}%")
+
+        else:
+
+            print("[-] Failed to change volume")
+
+    except Exception:
+
+        print("[-] Invalid Volume")
+
+# ==========================================
+# CHANGE TARGET IP
+# ==========================================
+
+def change_ip():
+
+    global target_ip
+
+    new_ip = input("Enter new ESP32 IP address: ").strip()
+
+    if new_ip:
+
+        target_ip = new_ip
+
+        print(f"[+] Target IP updated to {target_ip}")
+
+# ==========================================
+# PLAY AUDIO
+# ==========================================
+
+def play_audio():
+
+    print("[*] Sending PLAY...")
+
+    if reliable_send("PLAY"):
+
+        print("[+] Play command confirmed!")
+
+    else:
+
+        print("[-] Failed to start playback")
+
+# ==========================================
+# STOP AUDIO
+# ==========================================
+
+def stop_audio():
+
+    print("[*] Sending STOP...")
+
+    if reliable_send("STOP"):
+
+        print("[+] Stop command confirmed!")
+
+    else:
+
+        print("[-] Failed to stop playback")
+
+# ==========================================
+# MAIN MENU
+# ==========================================
+
+def main_menu():
+
+    while True:
+
+        print("\n===================================")
+        print("      ESP32 AUDIO CONTROLLER")
+        print("===================================")
+
+        print(f"TARGET IP : {target_ip}")
+        print(f"PORT      : {PORT}")
+
+        print("-----------------------------------")
+
+        print("0. Change Target IP")
+        print("1. Upload New Song")
+        print("2. Play Audio")
+        print("3. Stop Audio")
+        print("4. Set Volume")
+        print("5. Exit")
+
+        print("-----------------------------------")
+
+        choice = input("Select Option (0-5): ").strip()
+
+        # ==========================================
+
+        if choice == '0':
+
+            change_ip()
+
+        elif choice == '1':
+
+            upload_file()
+
+        elif choice == '2':
+
+            play_audio()
+
+        elif choice == '3':
+
+            stop_audio()
+
+        elif choice == '4':
+
+            set_volume()
+
+        elif choice == '5':
+
+            print("[*] Exiting Program...")
+            break
+
+        else:
+
+            print("[-] Invalid Option")
+
+# ==========================================
+# PROGRAM ENTRY
+# ==========================================
+
+if __name__ == "__main__":
+
+    main_menu()

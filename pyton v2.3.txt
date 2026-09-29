@@ -1,0 +1,358 @@
+import socket
+import os
+import time
+import struct
+import threading
+import re
+
+# ==========================================
+# GLOBAL CONFIGURATION
+# ==========================================
+
+target_ip = '192.168.0.250'
+PORT = 5500
+FILE_NAME = 'song.mp3'
+
+COMMAND_TIMEOUT = 4 
+UPLOAD_TIMEOUT = 60
+RETRY_DELAY = 1.5
+MAX_RETRIES = 5
+
+# ==========================================
+# CREATE ROBUST SOCKET
+# ==========================================
+
+def create_socket(timeout):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
+    sock.settimeout(timeout)
+    return sock
+
+# ==========================================
+# SAFE SOCKET CLOSE
+# ==========================================
+
+def safe_close(sock):
+    """Safely shutdown and close a socket, ignoring already-closed errors."""
+    if sock is None:
+        return
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass  
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+# ==========================================
+# RECEIVE FULL RESPONSE
+# ==========================================
+
+def receive_response(sock, max_bytes=2048, timeout=6):
+    response = b""
+    STOP_KEYWORDS = (b"ACK", b"UPLOAD_OK", b"ERR", b"ACK_PLAY", b"ACK_STOP", b"ACK_LIVE")
+    
+    try:
+        sock.settimeout(timeout)
+        while len(response) < max_bytes:
+            part = sock.recv(1024)
+            if not part:
+                break
+            response += part
+            for keyword in STOP_KEYWORDS:
+                if keyword in response:
+                    return response.decode(errors="ignore").strip()
+    except:
+        pass
+    return response.decode(errors="ignore").strip()
+
+# ==========================================
+# IP ADDRESS VALIDATOR
+# ==========================================
+
+def is_valid_ip(ip_str):
+    """Returns True if ip_str is a valid IPv4 address."""
+    pattern = r'^(\d{1,3}\.){3}\d{1,3}$'
+    if not re.match(pattern, ip_str):
+        return False
+    parts = ip_str.split('.')
+    return all(0 <= int(p) <= 255 for p in parts)
+
+# ==========================================
+# LOW LEVEL COMMAND SENDER (REMOVED \n)
+# ==========================================
+
+def send_command(cmd):
+    sock = create_socket(COMMAND_TIMEOUT)
+    try:
+        sock.connect((target_ip, PORT))
+        payload = cmd.strip()
+        sock.sendall(payload.encode())
+
+        response = receive_response(sock)
+
+        if "ACK" in response:
+            return True
+        elif "BUSY" in response:
+            print("[-] ESP32 is Busy (Upload/Live in progress)")
+            return False
+        else:
+            print(f"[-] Unexpected Response: '{response}'")
+            return False
+
+    except socket.timeout:
+        print("[-] Command Timeout")
+        return False
+    except ConnectionRefusedError:
+        print(f"[-] Connection Refused — is ESP32 at {target_ip}:{PORT} online?")
+        return False
+    except Exception as e:
+        print(f"[-] Network Error: {e}")
+        return False
+    finally:
+        safe_close(sock)
+
+# ==========================================
+# RELIABLE COMMAND WRAPPER
+# ==========================================
+
+def reliable_send(cmd, retries=MAX_RETRIES):
+    for attempt in range(1, retries + 1):
+        if send_command(cmd):
+            return True
+        print(f"[-] Retry {attempt}/{retries} ...")
+        time.sleep(RETRY_DELAY)
+    print(f"[-] All {retries} retries exhausted for command: {cmd}")
+    return False
+
+# ==========================================
+# UPLOAD FILE
+# ==========================================
+
+def upload_file():
+    if not os.path.exists(FILE_NAME):
+        print(f"[-] ERROR: '{FILE_NAME}' not found.")
+        return
+
+    file_size = os.path.getsize(FILE_NAME)
+    if file_size == 0:
+        print("[-] File is empty!")
+        return
+
+    sock = create_socket(UPLOAD_TIMEOUT * 2)
+
+    try:
+        sock.connect((target_ip, PORT))
+        sock.sendall("UPLD".encode())
+        time.sleep(0.8)
+
+        print(f"\n[*] Uploading {FILE_NAME} ({file_size/1024:.1f} KB)...")
+
+        bytes_sent = 0
+        with open(FILE_NAME, 'rb') as f:
+            while True:
+                chunk = f.read(2048)
+                if not chunk:
+                    break
+                sock.sendall(chunk)
+                bytes_sent += len(chunk)
+                percent = (bytes_sent / file_size) * 100
+                print(f"\r[*] {percent:.1f}% | {bytes_sent:,}/{file_size:,} bytes", end='', flush=True)
+
+        print("\n[+] File transfer done. Waiting for ESP32 response...")
+        sock.shutdown(socket.SHUT_WR)
+        response = receive_response(sock, max_bytes=2048)
+        
+        if "UPLOAD_OK" in response:
+            print("[+] ✅ Upload Successful! ESP32 will restart...")
+        elif "ERR" in response:
+            print(f"[-] Upload Failed: {response}")
+        else:
+            print(f"[?] Unknown Response: {response}")
+
+    except socket.timeout:
+        print("[-] Upload Timeout - Check network/SD card speed")
+    except ConnectionRefusedError:
+        print(f"[-] Connection Refused at {target_ip}:{PORT}")
+    except Exception as e:
+        print(f"[-] Upload Error: {e}")
+    finally:
+        safe_close(sock)
+
+# ==========================================
+# AUDIO COMMANDS
+# ==========================================
+
+def set_volume():
+    try:
+        raw = input("Enter Volume (0-100): ").strip()
+        if not raw.isdigit():
+            print("[-] Invalid input — please enter a number between 0 and 100.")
+            return
+        volume = int(raw)
+        volume = max(0, min(100, volume))
+        command = f"VOL:{volume}"
+        print(f"[*] Setting Volume = {volume}%")
+        if reliable_send(command):
+            print(f"[+] Volume changed to {volume}%")
+        else:
+            print("[-] Failed to change volume.")
+    except ValueError:
+        print("[-] Invalid Volume — enter a whole number.")
+    except KeyboardInterrupt:
+        print("\n[*] Volume change cancelled.")
+
+def change_ip():
+    global target_ip
+    new_ip = input("Enter new ESP32 IP address: ").strip()
+    if not new_ip:
+        print("[-] No IP entered. Keeping current:", target_ip)
+        return
+    if not is_valid_ip(new_ip):
+        print(f"[-] '{new_ip}' is not a valid IPv4 address. Keeping current: {target_ip}")
+        return
+    target_ip = new_ip
+    print(f"[+] Target IP updated to {target_ip}")
+
+def play_audio():
+    print("[*] Sending PLAY...")
+    if reliable_send("PLAY"):
+        print("[+] Play command confirmed!")
+    else:
+        print("[-] Failed to start playback.")
+
+def stop_audio():
+    print("[*] Sending STOP...")
+    if reliable_send("STOP"):
+        print("[+] Stop command confirmed!")
+    else:
+        print("[-] Failed to stop playback.")
+
+# ==========================================
+# LIVE STREAMING MODULE WITH GAIN BOOST
+# ==========================================
+
+def live_stream():
+    try:
+        import pyaudio
+        import numpy as np   # for test tone only
+    except ImportError:
+        print("\n[-] ERROR: PyAudio or numpy not installed.")
+        print("[*] Run: pip install pyaudio numpy")
+        return
+
+    print("\n[*] Initializing TCP Stream...")
+
+    sock = None
+    p = None
+    mic_stream = None
+
+    try:
+        sock = create_socket(UPLOAD_TIMEOUT)
+        sock.connect((target_ip, PORT))
+        sock.sendall("LIVE".encode())
+        time.sleep(0.5)
+
+        response = receive_response(sock)
+        if "ACK_LIVE" not in response:
+            print(f"[-] ESP32 rejected live stream. Response: '{response}'")
+            return
+
+        CHUNK = 1024
+        FORMAT = pyaudio.paInt16
+        CHANNELS = 1
+        RATE = 16000
+        GAIN = 8   # boost microphone signal
+
+        p = pyaudio.PyAudio()
+        mic_stream = p.open(format=FORMAT, channels=CHANNELS,
+                            rate=RATE, input=True, frames_per_buffer=CHUNK)
+
+        # Send dummy header
+        sock.sendall(b'\x00' * 44)
+        time.sleep(0.1)
+
+        print("\n🔊 Testing: Sending 1 kHz sine wave for 3 seconds...")
+        # Generate sine wave at 1 kHz, 16 kHz sample rate, 0.5 amplitude
+        t = np.linspace(0, 3, int(3 * RATE), endpoint=False)
+        sine = (int(16000 * 0.5) * np.sin(2 * np.pi * 1000 * t)).astype(np.int16)
+        sock.sendall(sine.tobytes())
+        time.sleep(3)
+
+        print("\n🎤 Now start speaking... (Press ENTER to stop)")
+        stop_event = threading.Event()
+        def wait_for_stop():
+            input()
+            stop_event.set()
+        threading.Thread(target=wait_for_stop, daemon=True).start()
+
+        while not stop_event.is_set():
+            data = mic_stream.read(CHUNK, exception_on_overflow=False)
+            # Apply gain
+            samples = np.frombuffer(data, dtype=np.int16).astype(np.int32)
+            samples = samples * GAIN
+            samples = np.clip(samples, -32768, 32767).astype(np.int16)
+            sock.sendall(samples.tobytes())
+
+    except Exception as e:
+        print(f"\n[-] Live Stream Error: {e}")
+    finally:
+        if mic_stream:
+            mic_stream.stop_stream()
+            mic_stream.close()
+        if p:
+            p.terminate()
+        safe_close(sock)
+        print("[+] Stream disconnected.")
+
+# ==========================================
+# MAIN MENU
+# ==========================================
+
+def main_menu():
+    while True:
+        print("\n===================================")
+        print("    AJEEVI AUDIO CONTROLLER")
+        print("===================================")
+        print(f"  TARGET IP : {target_ip}")
+        print(f"  PORT      : {PORT}")
+        print("-----------------------------------")
+        print("  0. Change Target IP")
+        print("  1. Upload New Song")
+        print("  2. Play Audio")
+        print("  3. Stop Audio")
+        print("  4. Set Volume")
+        print("  5. Live Announcement (Paging)")
+        print("  6. Exit")
+        print("-----------------------------------")
+
+        choice = input("Select Option (0-6): ").strip()
+
+        if choice == '0':
+            change_ip()
+        elif choice == '1':
+            upload_file()
+        elif choice == '2':
+            play_audio()
+        elif choice == '3':
+            stop_audio()
+        elif choice == '4':
+            set_volume()
+        elif choice == '5':
+            live_stream()
+        elif choice == '6':
+            print("[*] Exiting Program. Goodbye!")
+            break
+        else:
+            print(f"[-] Invalid Option '{choice}' — please enter 0 to 6.")
+
+# ==========================================
+# PROGRAM ENTRY
+# ==========================================
+
+if __name__ == "__main__":
+    main_menu()
